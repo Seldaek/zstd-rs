@@ -136,6 +136,15 @@ impl<'s> BitReaderReversed<'s> {
         debug_assert!(self.bits_consumed <= 64);
     }
 
+    /// Peeks at the next `n` bits, which the caller must have refilled. Branchless, also for `n == 0`.
+    #[inline(always)]
+    pub fn peek_bits_unchecked(&self, n: u8) -> u64 {
+        debug_assert!(self.bits_consumed + n <= 64);
+        self.bit_container
+            .wrapping_shr(u32::from(64 - self.bits_consumed - n))
+            & ((1u64 << n) - 1)
+    }
+
     /// Reads `n` bits, which the caller must have refilled. Branchless, also for `n == 0`.
     #[inline(always)]
     pub fn get_bits_unchecked(&mut self, n: u8) -> u64 {

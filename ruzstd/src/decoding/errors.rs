@@ -597,11 +597,29 @@ pub enum DecompressLiteralsError {
     HuffmanTableError(HuffmanTableError),
     HuffmanDecoderError(HuffmanDecoderError),
     UninitializedHuffmanTable,
-    MissingBytesForJumpHeader { got: usize },
-    MissingBytesForLiterals { got: usize, needed: usize },
-    ExtraPadding { skipped_bits: i32 },
-    BitstreamReadMismatch { read_til: isize, expected: isize },
-    DecodedLiteralCountMismatch { decoded: usize, expected: usize },
+    MissingBytesForJumpHeader {
+        got: usize,
+    },
+    MissingBytesForLiterals {
+        got: usize,
+        needed: usize,
+    },
+    ExtraPadding {
+        skipped_bits: i32,
+    },
+    BitstreamReadMismatch {
+        read_til: isize,
+        expected: isize,
+    },
+    DecodedLiteralCountMismatch {
+        decoded: usize,
+        expected: usize,
+    },
+    /// Four streams need at least 6 literals and 10 bytes, like libzstd requires.
+    TooSmallForFourStreams {
+        literals: usize,
+        bytes: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -656,6 +674,9 @@ impl core::fmt::Display for DecompressLiteralsError {
                     f,
                     "Bitstream was read till: {read_til}, should have been: {expected}",
                 )
+            }
+            DecompressLiteralsError::TooSmallForFourStreams { literals, bytes } => {
+                write!(f, "{literals} literals in {bytes} bytes are too few to be split into four streams")
             }
             DecompressLiteralsError::DecodedLiteralCountMismatch { decoded, expected } => {
                 write!(

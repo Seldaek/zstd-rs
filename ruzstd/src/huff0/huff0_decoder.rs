@@ -8,12 +8,15 @@ use alloc::vec::Vec;
 /// The Zstandard specification limits the maximum length of a code to 11 bits.
 pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
 
+// literals are decoded without it, the fuzz round trip still uses it
+#[cfg_attr(not(feature = "fuzz_exports"), allow(dead_code))]
 pub struct HuffmanDecoder<'table> {
     table: &'table HuffmanTable,
     /// State is used to index into the table.
     pub state: u64,
 }
 
+#[cfg_attr(not(feature = "fuzz_exports"), allow(dead_code))]
 impl<'t> HuffmanDecoder<'t> {
     /// Create a new decoder with the provided table
     pub fn new(table: &'t HuffmanTable) -> HuffmanDecoder<'t> {
@@ -86,6 +89,11 @@ impl HuffmanTable {
             rank_indexes: Vec::with_capacity(11),
             fse_table: FSETable::new(255),
         }
+    }
+
+    /// The decoding table, indexed by the next `max_num_bits` bits of the stream.
+    pub(crate) fn entries(&self) -> &[Entry] {
+        &self.decode
     }
 
     /// Completely empty the table then repopulate as a replica
@@ -388,9 +396,9 @@ impl Default for HuffmanTable {
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {
     /// The byte that the prefix code replaces during encoding.
-    symbol: u8,
+    pub(crate) symbol: u8,
     /// The number of bits the prefix code occupies.
-    num_bits: u8,
+    pub(crate) num_bits: u8,
 }
 
 /// Assert that the provided value is greater than zero, and returns the
