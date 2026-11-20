@@ -129,32 +129,6 @@ impl<'s> BitReaderReversed<'s> {
         (self.bit_container >> shift_by) & mask
     }
 
-    /// Get the next `n1` `n2` and `n3` bits from the source without consuming them.
-    /// Caller is responsible for making sure that `sum` many bits have been refilled.
-    #[inline(always)]
-    pub fn peek_bits_triple(&mut self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        if sum == 0 {
-            return (0, 0, 0);
-        }
-        // all_three contains bits like this: |XXXX..XXX111122223333|
-        // Where XXX are already consumed bytes, 1/2/3 are bits of the respective value
-        // Lower bits are to the right
-        let all_three = self.bit_container >> (64 - self.bits_consumed - sum);
-
-        let mask1 = (1u64 << n1) - 1u64;
-        let shift_by1 = n3 + n2;
-        let val1 = (all_three >> shift_by1) & mask1;
-
-        let mask2 = (1u64 << n2) - 1u64;
-        let shift_by2 = n3;
-        let val2 = (all_three >> shift_by2) & mask2;
-
-        let mask3 = (1u64 << n3) - 1u64;
-        let val3 = all_three & mask3;
-
-        (val1, val2, val3)
-    }
-
     /// Consume `n` bits from the source.
     #[inline(always)]
     pub fn consume(&mut self, n: u8) {
@@ -162,31 +136,16 @@ impl<'s> BitReaderReversed<'s> {
         debug_assert!(self.bits_consumed <= 64);
     }
 
-    /// Same as calling get_bits three times but slightly more performant
+    /// Reads `n` bits, which the caller must have refilled. Branchless, also for `n == 0`.
     #[inline(always)]
-    pub fn get_bits_triple(&mut self, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        let sum = n1 + n2 + n3;
-        if sum == 0 {
-            return (0, 0, 0);
-        }
-        if sum <= 56 {
-            self.refill();
-
-            let triple = self.peek_bits_triple(sum, n1, n2, n3);
-            self.consume(sum);
-            return triple;
-        }
-
-        (self.get_bits(n1), self.get_bits(n2), self.get_bits(n3))
-    }
-
-    /// Like get_bits_triple but doesn't check whether enough bits are available in the internal buffer
-    #[inline(always)]
-    pub fn get_bits_triple_unchecked(&mut self, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
-        let sum = n1 + n2 + n3;
-        let triple = self.peek_bits_triple(sum, n1, n2, n3);
-        self.consume(sum);
-        triple
+    pub fn get_bits_unchecked(&mut self, n: u8) -> u64 {
+        debug_assert!(self.bits_consumed + n <= 64);
+        let value = self
+            .bit_container
+            .wrapping_shr(u32::from(64 - self.bits_consumed - n))
+            & ((1u64 << n) - 1);
+        self.bits_consumed += n;
+        value
     }
 }
 

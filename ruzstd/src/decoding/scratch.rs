@@ -39,6 +39,7 @@ impl DecoderScratch {
                 ll_rle: None,
                 match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
                 ml_rle: None,
+                seq_tables: Default::default(),
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -63,6 +64,9 @@ impl DecoderScratch {
         self.fse.ll_rle = None;
         self.fse.ml_rle = None;
         self.fse.of_rle = None;
+        for t in &mut self.fse.seq_tables {
+            t.stale = true;
+        }
 
         self.huf.table.reset();
     }
@@ -103,6 +107,34 @@ pub struct FSEScratch {
     pub ll_rle: Option<u8>,
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
+    /// The tables above, resolved for decoding sequences (literal lengths, match lengths, offsets).
+    pub(crate) seq_tables: [SeqTable; 3],
+}
+
+/// One FSE state with its symbol resolved to the value and extra bits it stands for.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SeqEntry {
+    pub base_line: u32,
+    pub value: u32,
+    pub num_bits: u8,
+    pub extra_bits: u8,
+}
+
+pub(crate) struct SeqTable {
+    pub entries: Vec<SeqEntry>,
+    pub accuracy_log: u8,
+    /// Needs rebuilding from the FSE table or RLE symbol.
+    pub stale: bool,
+}
+
+impl Default for SeqTable {
+    fn default() -> Self {
+        SeqTable {
+            entries: Vec::new(),
+            accuracy_log: 0,
+            stale: true,
+        }
+    }
 }
 
 impl FSEScratch {
@@ -114,6 +146,7 @@ impl FSEScratch {
             ll_rle: None,
             match_lengths: FSETable::new(MAX_MATCH_LENGTH_CODE),
             ml_rle: None,
+            seq_tables: Default::default(),
         }
     }
 
@@ -124,6 +157,9 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
+        for t in &mut self.seq_tables {
+            t.stale = true;
+        }
     }
 }
 

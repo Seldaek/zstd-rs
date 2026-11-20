@@ -1,13 +1,14 @@
 use super::super::blocks::sequence_section::ModeType;
 use super::super::blocks::sequence_section::Sequence;
 use super::super::blocks::sequence_section::SequencesHeader;
-use super::scratch::FSEScratch;
+use super::scratch::{FSEScratch, SeqEntry, SeqTable};
 use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
 use crate::decoding::errors::DecodeSequenceError;
-use crate::fse::FSEDecoder;
+use crate::decoding::errors::FSEDecoderError;
+use crate::fse::FSETable;
 use alloc::vec::Vec;
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
@@ -39,240 +40,36 @@ pub fn decode_sequences(
         return Err(DecodeSequenceError::ExtraPadding { skipped_bits });
     }
 
-    if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, scratch, target)
-    } else {
-        decode_sequences_without_rle(section, &mut br, scratch, target)
-    }
-}
-
-fn decode_sequences_with_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
-
-    if scratch.ll_rle.is_none() {
-        ll_dec.init_state(br)?;
-    }
-    if scratch.of_rle.is_none() {
-        of_dec.init_state(br)?;
-    }
-    if scratch.ml_rle.is_none() {
-        ml_dec.init_state(br)?;
-    }
-
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    for _seq_idx in 0..section.num_sequences {
-        //get the codes from either the RLE byte or from the decoder
-        let ll_code = if let Some(ll_rle) = scratch.ll_rle {
-            ll_rle
-        } else {
-            ll_dec.decode_symbol()
-        };
-        let ml_code = if let Some(ml_rle) = scratch.ml_rle {
-            ml_rle
-        } else {
-            ml_dec.decode_symbol()
-        };
-        let of_code = if let Some(of_rle) = scratch.of_rle {
-            of_rle
-        } else {
-            of_dec.decode_symbol()
-        };
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        //println!("Sequence: {}", i);
-        //println!("of stat: {}", of_dec.state);
-        //println!("of Code: {}", of_code);
-        //println!("ll stat: {}", ll_dec.state);
-        //println!("ll bits: {}", ll_num_bits);
-        //println!("ll Code: {}", ll_value);
-        //println!("ml stat: {}", ml_dec.state);
-        //println!("ml bits: {}", ml_num_bits);
-        //println!("ml Code: {}", ml_value);
-        //println!("");
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
-            if scratch.ll_rle.is_none() {
-                ll_dec.update_state(br);
+    for (i, table) in scratch.seq_tables.iter_mut().enumerate() {
+        if table.stale {
+            match i {
+                0 => build_seq_table(
+                    table,
+                    &scratch.literal_lengths,
+                    scratch.ll_rle,
+                    lookup_ll_code,
+                    MAX_LITERAL_LENGTH_CODE,
+                )?,
+                1 => build_seq_table(
+                    table,
+                    &scratch.match_lengths,
+                    scratch.ml_rle,
+                    lookup_ml_code,
+                    MAX_MATCH_LENGTH_CODE,
+                )?,
+                _ => build_seq_table(
+                    table,
+                    &scratch.offsets,
+                    scratch.of_rle,
+                    |code| (1u32 << code, code),
+                    MAX_OFFSET_CODE,
+                )?,
             }
-            if scratch.ml_rle.is_none() {
-                ml_dec.update_state(br);
-            }
-            if scratch.of_rle.is_none() {
-                of_dec.update_state(br);
-            }
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
+            table.stale = false;
         }
     }
-
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn decode_sequences_without_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
-
-    ll_dec.init_state(br)?;
-    of_dec.init_state(br)?;
-    ml_dec.init_state(br)?;
-
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    let mut seq_idx = 0;
-    const UNROLL: u32 = 4;
-
-    // For each of the sequences we read a triple to update the fse states and one triple to decode the three parts of the sequence.
-    // The first read is bound by the tables maximum accuracy_log, which is 9 for literal and match length and 8 for offsets.
-    // The second read is bound by the additional bits literal/match length may need and the maximum supported offset.
-    // To be able to use refill_unchecked we need to make sure we have at least this amount left in the stream
-    //
-    // This means we would need to keep about 20 bytes in the stream to satisfy the maximum requirement
-    // Benchmarking shows that just checking against 32 is much cheaper and processing a few more sequences with the slower
-    // checked code is worth it
-    let max_bits_read_per_update = scratch.literal_lengths.accuracy_log
-        + scratch.match_lengths.accuracy_log
-        + scratch.offsets.accuracy_log;
-    let max_bits_read_per_triple = 16 + 16 + MAX_OFFSET_CODE;
-    let max_bits_read_per_loop =
-        max_bits_read_per_triple as u32 + max_bits_read_per_update as u32 * UNROLL;
-    let max_bytes_read_per_loop = max_bits_read_per_loop.div_ceil(8);
-    debug_assert!(max_bytes_read_per_loop <= 32);
-    const MAX_BYTES_READ_PER_LOOP: usize = 32;
-
-    if section.num_sequences > UNROLL {
-        while seq_idx < section.num_sequences - UNROLL && br.byte_idx() > MAX_BYTES_READ_PER_LOOP {
-            br.refill_unchecked();
-            let sequence1 = decode_sequence_without_rle(br, &mut ll_dec, &mut ml_dec, &mut of_dec)?;
-            FSEDecoder::update_state_triple::<true>(&mut ll_dec, &mut ml_dec, &mut of_dec, br);
-
-            br.refill_unchecked();
-            let sequence2 = decode_sequence_without_rle(br, &mut ll_dec, &mut ml_dec, &mut of_dec)?;
-            FSEDecoder::update_state_triple::<true>(&mut ll_dec, &mut ml_dec, &mut of_dec, br);
-
-            br.refill_unchecked();
-            let sequence3 = decode_sequence_without_rle(br, &mut ll_dec, &mut ml_dec, &mut of_dec)?;
-            FSEDecoder::update_state_triple::<true>(&mut ll_dec, &mut ml_dec, &mut of_dec, br);
-
-            br.refill_unchecked();
-            let sequence4 = decode_sequence_without_rle(br, &mut ll_dec, &mut ml_dec, &mut of_dec)?;
-            FSEDecoder::update_state_triple::<true>(&mut ll_dec, &mut ml_dec, &mut of_dec, br);
-
-            target.push(sequence1);
-            target.push(sequence2);
-            target.push(sequence3);
-            target.push(sequence4);
-
-            seq_idx += UNROLL;
-        }
-    }
-
-    while seq_idx < section.num_sequences {
-        br.refill();
-        let sequence = decode_sequence_without_rle(br, &mut ll_dec, &mut ml_dec, &mut of_dec)?;
-        if seq_idx < section.num_sequences - 1 {
-            FSEDecoder::update_state_triple::<false>(&mut ll_dec, &mut ml_dec, &mut of_dec, br);
-        }
-
-        target.push(sequence);
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-        seq_idx += 1;
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-#[inline(always)]
-/// Assumes the bitreader has been refilled before calling this
-fn decode_sequence_without_rle(
-    br: &mut BitReaderReversed<'_>,
-    ll_dec: &mut FSEDecoder<'_>,
-    ml_dec: &mut FSEDecoder<'_>,
-    of_dec: &mut FSEDecoder<'_>,
-) -> Result<Sequence, DecodeSequenceError> {
-    let ll_code = ll_dec.decode_symbol();
-    let ml_code = ml_dec.decode_symbol();
-    let of_code = of_dec.decode_symbol();
-
-    let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-    let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-    if of_code > MAX_OFFSET_CODE {
-        return Err(DecodeSequenceError::UnsupportedOffset {
-            offset_code: of_code,
-        });
-    }
-
-    let (obits, ml_add, ll_add) = br.get_bits_triple_unchecked(of_code, ml_num_bits, ll_num_bits);
-    let offset = obits as u32 + (1u32 << of_code);
-
-    if offset == 0 {
-        return Err(DecodeSequenceError::ZeroOffset);
-    }
-
-    Ok(Sequence {
-        ll: ll_value + ll_add as u32,
-        ml: ml_value + ml_add as u32,
-        of: offset,
-    })
+    let [ll, ml, of] = &scratch.seq_tables;
+    decode_sequences_with_tables(section.num_sequences, &mut br, ll, ml, of, target)
 }
 
 /// Look up the provided state value from a literal length table predefined
@@ -346,6 +143,132 @@ pub const ML_MAX_LOG: u8 = 9;
 /// "The maximum accuracy log for the offset table is 8."
 pub const OF_MAX_LOG: u8 = 8;
 
+/// Resolves an FSE table (or RLE symbol) into a sequence table.
+fn build_seq_table(
+    out: &mut SeqTable,
+    fse: &FSETable,
+    rle: Option<u8>,
+    lookup: impl Fn(u8) -> (u32, u8),
+    max_code: u8,
+) -> Result<(), DecodeSequenceError> {
+    out.entries.clear();
+    if let Some(code) = rle {
+        // a single state that reads no bits
+        let (value, extra_bits) = lookup(code);
+        out.entries.push(SeqEntry {
+            base_line: 0,
+            value,
+            num_bits: 0,
+            extra_bits,
+        });
+        out.accuracy_log = 0;
+        return Ok(());
+    }
+    if fse.accuracy_log == 0 {
+        return Err(FSEDecoderError::TableIsUninitialized.into());
+    }
+    for e in &fse.decode {
+        if e.symbol > max_code {
+            return Err(DecodeSequenceError::UnsupportedOffset {
+                offset_code: e.symbol,
+            });
+        }
+        let (value, extra_bits) = lookup(e.symbol);
+        out.entries.push(SeqEntry {
+            base_line: e.base_line,
+            value,
+            num_bits: e.num_bits,
+            extra_bits,
+        });
+    }
+    out.accuracy_log = fse.accuracy_log;
+    Ok(())
+}
+
+/// libzstd's limits: at least 57 bits are readable after a refill, and the three state updates read at most
+/// 9 + 9 + 8 bits.
+const BITS_AFTER_REFILL: u8 = 57;
+const MAX_STATE_BITS: u8 = 26;
+
+#[inline(always)]
+fn refill<const UNCHECKED: bool>(br: &mut BitReaderReversed<'_>) {
+    if UNCHECKED {
+        br.refill_unchecked();
+    } else {
+        br.refill();
+    }
+}
+
+/// Decodes one sequence and, unless it is the last one, advances the states. The reader must be refilled.
+#[inline(always)]
+fn decode_one<const UNCHECKED: bool>(
+    br: &mut BitReaderReversed<'_>,
+    states: &mut [u32; 3],
+    tables: [&[SeqEntry]; 3],
+    last: bool,
+) -> Sequence {
+    let ll = tables[0][states[0] as usize];
+    let ml = tables[1][states[1] as usize];
+    let of = tables[2][states[2] as usize];
+    let extra = of.extra_bits + ml.extra_bits + ll.extra_bits;
+    let of_add = br.get_bits_unchecked(of.extra_bits);
+    let ml_add = br.get_bits_unchecked(ml.extra_bits);
+    if extra > BITS_AFTER_REFILL {
+        refill::<UNCHECKED>(br);
+    }
+    let ll_add = br.get_bits_unchecked(ll.extra_bits);
+    if !last {
+        if extra > BITS_AFTER_REFILL - MAX_STATE_BITS {
+            refill::<UNCHECKED>(br);
+        }
+        states[0] = ll.base_line + br.get_bits_unchecked(ll.num_bits) as u32;
+        states[1] = ml.base_line + br.get_bits_unchecked(ml.num_bits) as u32;
+        states[2] = of.base_line + br.get_bits_unchecked(of.num_bits) as u32;
+    }
+    Sequence {
+        ll: ll.value + ll_add as u32,
+        ml: ml.value + ml_add as u32,
+        of: of.value + of_add as u32,
+    }
+}
+
+fn decode_sequences_with_tables(
+    num_sequences: u32,
+    br: &mut BitReaderReversed<'_>,
+    ll: &SeqTable,
+    ml: &SeqTable,
+    of: &SeqTable,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    let tables = [&ll.entries[..], &ml.entries[..], &of.entries[..]];
+    let mut states = [0u32; 3];
+    states[0] = br.get_bits(ll.accuracy_log) as u32;
+    states[2] = br.get_bits(of.accuracy_log) as u32;
+    states[1] = br.get_bits(ml.accuracy_log) as u32;
+
+    target.clear();
+    target.reserve(num_sequences as usize);
+    let num = num_sequences as usize;
+    let mut i = 0;
+    // a sequence reads at most 63 + 26 bits, so 16 bytes left in the stream make the unchecked refills safe
+    while i + 1 < num && br.byte_idx() > 16 {
+        br.refill_unchecked();
+        target.push(decode_one::<true>(br, &mut states, tables, false));
+        i += 1;
+    }
+    while i < num {
+        br.refill();
+        target.push(decode_one::<false>(br, &mut states, tables, i + 1 == num));
+        i += 1;
+    }
+
+    match br.bits_remaining() {
+        0 => Ok(()),
+        r if r < 0 => Err(DecodeSequenceError::NotEnoughBytesForNumSequences),
+        r => Err(DecodeSequenceError::ExtraBits { bits_remaining: r }),
+    }
+}
+
 fn maybe_update_fse_tables(
     section: &SequencesHeader,
     source: &[u8],
@@ -356,6 +279,17 @@ fn maybe_update_fse_tables(
         .ok_or(DecodeSequenceError::MissingCompressionMode)?;
 
     let mut bytes_read = 0;
+
+    for (table, mode) in
+        scratch
+            .seq_tables
+            .iter_mut()
+            .zip([modes.ll_mode(), modes.ml_mode(), modes.of_mode()])
+    {
+        if !matches!(mode, ModeType::Repeat) {
+            table.stale = true;
+        }
+    }
 
     match modes.ll_mode() {
         ModeType::FSECompressed => {
