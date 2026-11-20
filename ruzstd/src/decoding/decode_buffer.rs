@@ -97,6 +97,23 @@ impl DecodeBuffer {
         self.total_output_counter += amount as u64;
     }
 
+    /// Runs `write` on the buffer and the current end, with room for `max` bytes plus `SLACK` past it.
+    /// `write` returns the new end, at most `max` bytes further.
+    #[inline(always)]
+    pub(crate) fn write_block<E>(
+        &mut self,
+        max: usize,
+        write: impl FnOnce(&mut [u8], usize) -> Result<usize, E>,
+    ) -> Result<(), E> {
+        self.ensure(max);
+        let end = self.end;
+        let new_end = write(&mut self.buf, end)?;
+        debug_assert!(new_end >= end && new_end - end <= max);
+        self.total_output_counter += (new_end - end) as u64;
+        self.end = new_end;
+        Ok(())
+    }
+
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
         self.write_with(fill_length, |buf, end| {
             buf[end..end + fill_length].fill(fill_with)
@@ -236,7 +253,7 @@ impl DecodeBuffer {
 /// Appends `len` bytes at `end`, copied from `offset` bytes back, with LZ77 semantics: when `offset < len`,
 /// the copy repeats the bytes it is writing. May write up to `SLACK` bytes past `end + len`.
 #[inline(always)]
-fn copy_match(buf: &mut [u8], end: usize, offset: usize, len: usize) {
+pub(crate) fn copy_match(buf: &mut [u8], end: usize, offset: usize, len: usize) {
     let src = end - offset;
     if offset >= 16 && len <= SLACK {
         // each 16 byte chunk only reads bytes that are final already
@@ -246,6 +263,10 @@ fn copy_match(buf: &mut [u8], end: usize, offset: usize, len: usize) {
         }
     } else if offset >= len {
         buf.copy_within(src..src + len, end);
+    } else if len <= 16 {
+        for i in 0..len {
+            buf[end + i] = buf[src + i];
+        }
     } else {
         // the pattern repeats every `offset` bytes, so the copied part can double each time
         let mut copied = 0;
