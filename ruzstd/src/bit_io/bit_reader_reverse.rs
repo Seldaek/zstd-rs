@@ -1,4 +1,4 @@
-use core::convert::TryInto;
+use core::convert::{TryFrom, TryInto};
 
 /// Zstandard encodes some types of data in a way that the data must be read
 /// back to front to decode it properly. `BitReaderReversed` provides a
@@ -162,6 +162,96 @@ impl<'s> BitReaderReversed<'s> {
             & ((1u64 << n) - 1);
         self.bits_consumed += n;
         value
+    }
+}
+
+/// Reads a bitstream like [BitReaderReversed], for the part that is far enough from its start for unchecked
+/// refills.
+///
+/// The unread bits are kept at the top of `buf`, and a refill ors in the bytes before `pos` below them. The
+/// position of that read only depends on the previous refill, so unlike reloading the whole container,
+/// it does not wait for the bits consumed since to be known. The stream is `source[start..]`, where
+/// several readers can share one `source`.
+pub(crate) struct FastBits {
+    /// Bytes of `source` before this are not in `buf` yet.
+    pos: usize,
+    buf: u64,
+    /// Valid bits in `buf`. Below them are the next bits of the stream already, or zeroes.
+    count: u32,
+}
+
+impl FastBits {
+    /// At least this many bits are valid after a refill.
+    pub(crate) const AFTER_REFILL: u32 = 56;
+
+    /// Takes over from `br`, which reads a stream starting at `source[start]`. None if the stream is too
+    /// short for a refill, or was read past its start.
+    #[inline(always)]
+    pub(crate) fn new(source: &[u8], start: usize, br: &BitReaderReversed<'_>) -> Option<Self> {
+        let unread = usize::try_from(br.bits_remaining()).ok()?;
+        let bytes = unread.div_ceil(8);
+        if bytes < 8 || start + bytes > source.len() {
+            return None;
+        }
+        let mut bits = FastBits {
+            pos: start + bytes,
+            buf: 0,
+            count: 0,
+        };
+        bits.refill(source);
+        // the bits of the last byte that were read already
+        bits.consume((bytes * 8 - unread) as u32);
+        Some(bits)
+    }
+
+    /// How many times this can refill without reading before `start`: a refill reads the 8 bytes before
+    /// `pos` and moves it by at most 7.
+    #[inline(always)]
+    pub(crate) fn refills_from(&self, start: usize) -> usize {
+        (self.pos - start).saturating_sub(1) / 7
+    }
+
+    /// Whether `refills_from(start) >= times`.
+    #[inline(always)]
+    pub(crate) fn can_refill(&self, start: usize, times: usize) -> bool {
+        self.pos - start > 7 * times
+    }
+
+    #[inline(always)]
+    pub(crate) fn refill(&mut self, source: &[u8]) {
+        let word = u64::from_le_bytes(source[self.pos - 8..self.pos].try_into().unwrap());
+        self.buf |= word >> self.count;
+        self.pos -= ((63 - self.count) >> 3) as usize;
+        self.count |= 56;
+    }
+
+    /// The `n` bits found after skipping `skip` bits. Branchless, also for `n == 0`.
+    #[inline(always)]
+    pub(crate) fn peek_at(&self, skip: u32, n: u32) -> u64 {
+        debug_assert!(skip + n <= self.count && n < 64);
+        ((self.buf << skip) >> 1) >> (63 - n)
+    }
+
+    /// The next `64 - shift` bits, at least one.
+    #[inline(always)]
+    pub(crate) fn peek_top(&self, shift: u32) -> u64 {
+        self.buf >> shift
+    }
+
+    #[inline(always)]
+    pub(crate) fn consume(&mut self, n: u32) {
+        self.buf <<= n;
+        self.count -= n;
+    }
+
+    /// A reader positioned on the same bit of the stream starting at `source[start]`.
+    #[inline(always)]
+    pub(crate) fn into_reader(self, source: &[u8], start: usize) -> BitReaderReversed<'_> {
+        let unread = (self.pos - start) * 8 + self.count as usize;
+        let bytes = unread.div_ceil(8);
+        let mut br = BitReaderReversed::new(&source[start..start + bytes]);
+        br.get_bits((bytes * 8 - unread) as u8);
+        br
     }
 }
 

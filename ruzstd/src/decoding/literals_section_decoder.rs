@@ -3,7 +3,7 @@
 
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::scratch::HuffmanScratch;
-use crate::bit_io::BitReaderReversed;
+use crate::bit_io::{BitReaderReversed, FastBits};
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::Entry;
 use alloc::vec::Vec;
@@ -96,32 +96,18 @@ fn decompress_literals(
 
         // each of the first three streams decodes to exactly a quarter (rounded up), the last one to the rest
         let segment = regenerated.div_ceil(4);
-        let (out1, rest) = out.split_at_mut(segment);
-        let (out2, rest) = rest.split_at_mut(segment);
-        let (out3, out4) = rest.split_at_mut(segment);
+        let starts = [0, jump1, jump2, jump3];
         let mut readers = [
             init_reader(&source[..jump1])?,
             init_reader(&source[jump1..jump2])?,
             init_reader(&source[jump2..jump3])?,
             init_reader(&source[jump3..])?,
         ];
-        let mut outs = [out1, out2, out3, out4];
-
-        // all four in lockstep while every reader can refill unchecked: five symbols fit in the 57 bits after a refill
-        let mut pos = 0;
-        while pos + 5 <= outs[3].len() && readers.iter().all(|br| br.byte_idx() >= 8) {
-            for br in &mut readers {
-                br.refill_unchecked();
-            }
-            for k in 0..5 {
-                for (br, out) in readers.iter_mut().zip(outs.iter_mut()) {
-                    out[pos + k] = decode_symbol(br, table, max_bits);
-                }
-            }
-            pos += 5;
-        }
-        for (br, out) in readers.iter_mut().zip(outs.iter_mut()) {
-            decode_stream_rest(br, &mut out[pos..], table, max_bits)?;
+        let decoded =
+            decode_four_streams(table, max_bits, source, starts, &mut readers, out, segment);
+        for (k, br) in readers.iter_mut().enumerate() {
+            let end = (segment * (k + 1)).min(regenerated);
+            decode_stream_rest(br, &mut out[segment * k + decoded..end], table, max_bits)?;
         }
 
         bytes_read += source.len() as u32;
@@ -160,6 +146,74 @@ fn init_reader(stream: &[u8]) -> Result<BitReaderReversed<'_>, DecompressLiteral
         return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
     }
     Ok(br)
+}
+
+/// Decodes the four streams of `source` in lockstep for as long as all of them can refill unchecked, each to
+/// its `segment` of `out`. Leaves `readers` after the last symbol decoded and returns how many each stream
+/// decoded.
+fn decode_four_streams<'a>(
+    table: &[Entry],
+    max_bits: u8,
+    source: &'a [u8],
+    starts: [usize; 4],
+    readers: &mut [BitReaderReversed<'a>; 4],
+    out: &mut [u8],
+    segment: usize,
+) -> usize {
+    /// Five symbols of up to 11 bits fit in the 56 bits a refill provides.
+    const SYMBOLS: usize = 5;
+    let (Some(a), Some(b), Some(c), Some(d)) = (
+        FastBits::new(source, starts[0], &readers[0]),
+        FastBits::new(source, starts[1], &readers[1]),
+        FastBits::new(source, starts[2], &readers[2]),
+        FastBits::new(source, starts[3], &readers[3]),
+    ) else {
+        return 0;
+    };
+    let mut bits = [a, b, c, d];
+    // the table has a power of two entries, masking the index instead of checking it
+    let mask = table.len().wrapping_sub(1);
+    let shift = 64 - u32::from(max_bits);
+    if table.is_empty()
+        || shift >= 64
+        || u32::from(max_bits) * SYMBOLS as u32 > FastBits::AFTER_REFILL
+    {
+        return 0;
+    }
+    // symbols are written 8 bytes at a time, which must stay within the stream's segment
+    let last_segment = out.len() - 3 * segment;
+    let mut decoded = 0;
+    loop {
+        let mut rounds = last_segment.saturating_sub(decoded + 8 - SYMBOLS) / SYMBOLS;
+        for (bits, &start) in bits.iter().zip(&starts) {
+            rounds = rounds.min(bits.refills_from(start));
+        }
+        if rounds == 0 {
+            break;
+        }
+        for _ in 0..rounds {
+            for (k, bits) in bits.iter_mut().enumerate() {
+                bits.refill(source);
+                let mut symbols = 0u64;
+                for i in 0..SYMBOLS {
+                    let entry = table[bits.peek_top(shift) as usize & mask];
+                    bits.consume(u32::from(entry.num_bits));
+                    symbols |= u64::from(entry.symbol) << (8 * i);
+                }
+                let at = segment * k + decoded;
+                out[at..at + 8].copy_from_slice(&symbols.to_le_bytes());
+            }
+            decoded += SYMBOLS;
+        }
+    }
+    let [a, b, c, d] = bits;
+    *readers = [
+        a.into_reader(source, starts[0]),
+        b.into_reader(source, starts[1]),
+        c.into_reader(source, starts[2]),
+        d.into_reader(source, starts[3]),
+    ];
+    decoded
 }
 
 /// Decodes one symbol; the reader must hold at least `max_bits` refilled bits.
