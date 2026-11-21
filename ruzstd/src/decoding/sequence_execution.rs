@@ -116,21 +116,26 @@ impl<'a> Executor<'a> {
         if ll > 16 || offset < 32 {
             copy_uncommon(self.buf, pos, &literals[..ll], offset, ml);
         } else {
-            // 32 byte chunks only read bytes that are final already; most matches fit in one, and going on
-            // per 32 bytes keeps the exit of this loop predictable
-            let src = literals_end - offset;
-            let mut i = 0;
-            loop {
-                self.buf
-                    .copy_within(src + i..src + i + 32, literals_end + i);
-                i += 32;
-                if i >= ml {
-                    break;
-                }
+            // 32 byte chunks only read bytes that are final already. Most matches fit in the first one.
+            let (history, output) = self.buf.split_at_mut(literals_end);
+            output[..32].copy_from_slice(&history[literals_end - offset..][..32]);
+            if ml > 32 {
+                copy_match_rest(self.buf, literals_end, offset, ml);
             }
         }
         self.pos = end;
         true
+    }
+}
+
+/// Copies what is left of a match after its first 32 bytes, in chunks of 32 from at least as far back.
+#[inline(always)]
+fn copy_match_rest(buf: &mut [u8], literals_end: usize, offset: usize, ml: usize) {
+    let src = literals_end - offset;
+    let mut i = 32;
+    while i < ml {
+        buf.copy_within(src + i..src + i + 32, literals_end + i);
+        i += 32;
     }
 }
 
