@@ -1,7 +1,7 @@
 use super::super::blocks::sequence_section::ModeType;
 use super::super::blocks::sequence_section::Sequence;
 use super::super::blocks::sequence_section::SequencesHeader;
-use super::scratch::{FSEScratch, SeqEntry, SeqTable, SEQ_TABLE_SIZE};
+use super::scratch::{FSEScratch, SeqEntry, SeqTables, SEQ_TABLES_SIZE, SEQ_TABLE_SIZE};
 use crate::bit_io::{BitReaderReversed, FastBits};
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
@@ -40,38 +40,43 @@ pub(crate) fn read_sequences<'a>(
         return Err(DecodeSequenceError::ExtraPadding { skipped_bits });
     }
 
-    for (i, table) in scratch.seq_tables.iter_mut().enumerate() {
-        if table.stale {
-            match i {
+    let tables = &mut scratch.seq_tables;
+    for kind in 0..3 {
+        if tables.stale[kind] {
+            let first = kind * SEQ_TABLE_SIZE;
+            let out = &mut tables.entries[first..first + SEQ_TABLE_SIZE];
+            tables.accuracy_logs[kind] = match kind {
                 0 => build_seq_table(
-                    table,
+                    out,
+                    first as u16,
                     &scratch.literal_lengths,
                     scratch.ll_rle,
                     lookup_ll_code,
                     MAX_LITERAL_LENGTH_CODE,
                 )?,
                 1 => build_seq_table(
-                    table,
+                    out,
+                    first as u16,
                     &scratch.match_lengths,
                     scratch.ml_rle,
                     lookup_ml_code,
                     MAX_MATCH_LENGTH_CODE,
                 )?,
                 _ => build_seq_table(
-                    table,
+                    out,
+                    first as u16,
                     &scratch.offsets,
                     scratch.of_rle,
                     |code| (1u32 << code, code),
                     MAX_OFFSET_CODE,
                 )?,
-            }
-            table.stale = false;
+            };
+            tables.stale[kind] = false;
         }
     }
-    let [ll, ml, of] = &scratch.seq_tables;
     Ok(SequenceReader::new(
         br,
-        [ll, ml, of],
+        &scratch.seq_tables,
         section.num_sequences as usize,
     ))
 }
@@ -131,31 +136,32 @@ pub const ML_MAX_LOG: u8 = 9;
 /// "The maximum accuracy log for the offset table is 8."
 pub const OF_MAX_LOG: u8 = 8;
 
-/// Resolves an FSE table (or RLE symbol) into a sequence table.
+/// Resolves an FSE table (or RLE symbol) into the sequence table starting at state `first`, and returns its
+/// accuracy log.
 fn build_seq_table(
-    out: &mut SeqTable,
+    out: &mut [SeqEntry],
+    first: u16,
     fse: &FSETable,
     rle: Option<u8>,
     lookup: impl Fn(u8) -> (u32, u8),
     max_code: u8,
-) -> Result<(), DecodeSequenceError> {
+) -> Result<u8, DecodeSequenceError> {
     if let Some(code) = rle {
         // a single state that reads no bits
         let (value, extra_bits) = lookup(code);
-        out.entries[0] = SeqEntry {
-            base_line: 0,
+        out[0] = SeqEntry {
+            base_line: first,
             value,
             num_bits: 0,
             extra_bits,
         };
-        out.accuracy_log = 0;
-        return Ok(());
+        return Ok(0);
     }
     if fse.accuracy_log == 0 {
         return Err(FSEDecoderError::TableIsUninitialized.into());
     }
     debug_assert!(fse.decode.len() <= SEQ_TABLE_SIZE);
-    for (e, out) in fse.decode.iter().zip(out.entries.iter_mut()) {
+    for (e, out) in fse.decode.iter().zip(out.iter_mut()) {
         if e.symbol > max_code {
             return Err(DecodeSequenceError::UnsupportedOffset {
                 offset_code: e.symbol,
@@ -163,14 +169,13 @@ fn build_seq_table(
         }
         let (value, extra_bits) = lookup(e.symbol);
         *out = SeqEntry {
-            base_line: e.base_line as u16,
+            base_line: first + e.base_line as u16,
             value,
             num_bits: e.num_bits,
             extra_bits,
         };
     }
-    out.accuracy_log = fse.accuracy_log;
-    Ok(())
+    Ok(fse.accuracy_log)
 }
 
 /// libzstd's limits: at least 57 bits are readable after a refill, and the three state updates read at most
@@ -192,12 +197,12 @@ fn refill<const UNCHECKED: bool>(br: &mut BitReaderReversed<'_>) {
 fn decode_one<const UNCHECKED: bool>(
     br: &mut BitReaderReversed<'_>,
     states: &mut [u32; 3],
-    tables: [&[SeqEntry; SEQ_TABLE_SIZE]; 3],
+    table: &[SeqEntry; SEQ_TABLES_SIZE],
     last: bool,
 ) -> Sequence {
-    let ll = tables[0][states[0] as usize % SEQ_TABLE_SIZE];
-    let ml = tables[1][states[1] as usize % SEQ_TABLE_SIZE];
-    let of = tables[2][states[2] as usize % SEQ_TABLE_SIZE];
+    let ll = table[states[0] as usize % SEQ_TABLES_SIZE];
+    let ml = table[states[1] as usize % SEQ_TABLES_SIZE];
+    let of = table[states[2] as usize % SEQ_TABLES_SIZE];
     let extra = of.extra_bits + ml.extra_bits + ll.extra_bits;
     let of_add = br.get_bits_unchecked(of.extra_bits);
     let ml_add = br.get_bits_unchecked(ml.extra_bits);
@@ -224,20 +229,22 @@ fn decode_one<const UNCHECKED: bool>(
 pub(crate) struct SequenceReader<'a> {
     br: BitReaderReversed<'a>,
     states: [u32; 3],
-    tables: [&'a [SeqEntry; SEQ_TABLE_SIZE]; 3],
+    /// The three tables, see [SeqTables].
+    table: &'a [SeqEntry; SEQ_TABLES_SIZE],
     remaining: usize,
 }
 
 impl<'a> SequenceReader<'a> {
-    fn new(mut br: BitReaderReversed<'a>, tables: [&'a SeqTable; 3], num_sequences: usize) -> Self {
+    fn new(mut br: BitReaderReversed<'a>, tables: &'a SeqTables, num_sequences: usize) -> Self {
         let mut states = [0u32; 3];
-        states[0] = br.get_bits(tables[0].accuracy_log) as u32;
-        states[2] = br.get_bits(tables[2].accuracy_log) as u32;
-        states[1] = br.get_bits(tables[1].accuracy_log) as u32;
+        let logs = tables.accuracy_logs;
+        states[0] = br.get_bits(logs[0]) as u32;
+        states[2] = 2 * SEQ_TABLE_SIZE as u32 + br.get_bits(logs[2]) as u32;
+        states[1] = SEQ_TABLE_SIZE as u32 + br.get_bits(logs[1]) as u32;
         SequenceReader {
             br,
             states,
-            tables: [&tables[0].entries, &tables[1].entries, &tables[2].entries],
+            table: &tables.entries,
             remaining: num_sequences,
         }
     }
@@ -254,7 +261,7 @@ impl<'a> SequenceReader<'a> {
             decode_one::<true>(
                 &mut self.br,
                 &mut self.states,
-                self.tables,
+                self.table,
                 self.remaining == 0,
             )
         } else {
@@ -262,7 +269,7 @@ impl<'a> SequenceReader<'a> {
             decode_one::<false>(
                 &mut self.br,
                 &mut self.states,
-                self.tables,
+                self.table,
                 self.remaining == 0,
             )
         })
@@ -276,16 +283,16 @@ impl<'a> SequenceReader<'a> {
         let Some(mut bits) = FastBits::new(source, 0, &self.br) else {
             return;
         };
-        let [ll_table, ml_table, of_table] = self.tables;
+        let table = self.table;
         let [mut ll_state, mut ml_state, mut of_state] = self.states;
         let mut remaining = self.remaining;
         // a sequence refills at most twice
         while remaining > 1 && bits.can_refill(0, 2) {
             remaining -= 1;
             bits.refill(source);
-            let ll = ll_table[ll_state as usize % SEQ_TABLE_SIZE];
-            let ml = ml_table[ml_state as usize % SEQ_TABLE_SIZE];
-            let of = of_table[of_state as usize % SEQ_TABLE_SIZE];
+            let ll = table[ll_state as usize % SEQ_TABLES_SIZE];
+            let ml = table[ml_state as usize % SEQ_TABLES_SIZE];
+            let of = table[of_state as usize % SEQ_TABLES_SIZE];
             let (ll_extra, ml_extra, of_extra) = (
                 u32::from(ll.extra_bits),
                 u32::from(ml.extra_bits),
@@ -347,14 +354,15 @@ fn maybe_update_fse_tables(
 
     let mut bytes_read = 0;
 
-    for (table, mode) in
+    for (stale, mode) in
         scratch
             .seq_tables
+            .stale
             .iter_mut()
             .zip([modes.ll_mode(), modes.ml_mode(), modes.of_mode()])
     {
         if !matches!(mode, ModeType::Repeat) {
-            table.stale = true;
+            *stale = true;
         }
     }
 

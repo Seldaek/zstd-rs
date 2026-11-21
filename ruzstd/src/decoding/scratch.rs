@@ -65,9 +65,7 @@ impl DecoderScratch {
         self.fse.ll_rle = None;
         self.fse.ml_rle = None;
         self.fse.of_rle = None;
-        for t in &mut self.fse.seq_tables {
-            t.stale = true;
-        }
+        self.fse.seq_tables.stale = [true; 3];
 
         self.huf.table.reset();
     }
@@ -109,14 +107,14 @@ pub struct FSEScratch {
     pub match_lengths: FSETable,
     pub ml_rle: Option<u8>,
     /// The tables above, resolved for decoding sequences (literal lengths, match lengths, offsets).
-    pub(crate) seq_tables: [SeqTable; 3],
+    pub(crate) seq_tables: SeqTables,
 }
 
 /// One FSE state with its symbol resolved to the value and extra bits it stands for.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SeqEntry {
     pub value: u32,
-    // 8 bytes per entry: there are at most 2^9 states
+    // 8 bytes per entry: states are below `SEQ_TABLES_SIZE`
     pub base_line: u16,
     pub num_bits: u8,
     pub extra_bits: u8,
@@ -124,21 +122,24 @@ pub(crate) struct SeqEntry {
 
 /// The most states a sequence table can have.
 pub(crate) const SEQ_TABLE_SIZE: usize = 1 << 9;
+/// Room for the three tables, rounded up so that states index it with a mask instead of a bounds check.
+pub(crate) const SEQ_TABLES_SIZE: usize = 4 * SEQ_TABLE_SIZE;
 
-pub(crate) struct SeqTable {
-    /// Of a fixed size so states index it with a mask instead of a bounds check.
-    pub entries: Box<[SeqEntry; SEQ_TABLE_SIZE]>,
-    pub accuracy_log: u8,
-    /// Needs rebuilding from the FSE table or RLE symbol.
-    pub stale: bool,
+/// The literal length, match length and offset tables, one after the other every `SEQ_TABLE_SIZE` entries.
+/// States count from the start of `entries`, so that decoding needs a single pointer for the three.
+pub(crate) struct SeqTables {
+    pub entries: Box<[SeqEntry; SEQ_TABLES_SIZE]>,
+    pub accuracy_logs: [u8; 3],
+    /// Which need rebuilding from their FSE table or RLE symbol.
+    pub stale: [bool; 3],
 }
 
-impl Default for SeqTable {
+impl Default for SeqTables {
     fn default() -> Self {
-        SeqTable {
-            entries: Box::new([SeqEntry::default(); SEQ_TABLE_SIZE]),
-            accuracy_log: 0,
-            stale: true,
+        SeqTables {
+            entries: Box::new([SeqEntry::default(); SEQ_TABLES_SIZE]),
+            accuracy_logs: [0; 3],
+            stale: [true; 3],
         }
     }
 }
@@ -163,9 +164,7 @@ impl FSEScratch {
         self.of_rle = other.of_rle;
         self.ll_rle = other.ll_rle;
         self.ml_rle = other.ml_rle;
-        for t in &mut self.seq_tables {
-            t.stale = true;
-        }
+        self.seq_tables.stale = [true; 3];
     }
 }
 

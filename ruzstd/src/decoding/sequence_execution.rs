@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 /// Take the provided decoder and execute the sequences stored within
 /// Decodes and executes a block's sequences in one pass, for frames without a dictionary.
+#[inline(never)]
 pub(crate) fn decode_and_execute_sequences(
     section: &SequencesHeader,
     source: &[u8],
@@ -31,7 +32,6 @@ pub(crate) fn decode_and_execute_sequences(
             literals_len,
             start,
             pos: start,
-            lit: 0,
             hist,
             limit: start + max_block_decoded_len,
             error: None,
@@ -48,16 +48,16 @@ pub(crate) fn decode_and_execute_sequences(
         if let Some(error) = exec.error {
             return Err(error);
         }
-        let (pos, lit) = (exec.pos, exec.lit);
-        let rest = literals_len - lit;
-        if pos + rest > exec.limit {
+        let pos = exec.pos;
+        let rest = &exec.literals[..exec.literals.len() - SLACK];
+        if pos + rest.len() > exec.limit {
             return Err(ExecuteSequencesError::TooManyBytesGenerated {
                 max: max_block_decoded_len,
-                decoded: pos - start + rest,
+                decoded: pos - start + rest.len(),
             });
         }
-        exec.buf[pos..pos + rest].copy_from_slice(&literals[lit..literals_len]);
-        Ok(pos + rest)
+        exec.buf[pos..pos + rest.len()].copy_from_slice(rest);
+        Ok(pos + rest.len())
     });
     *offset_hist = hist;
     literals_buffer.truncate(literals_len);
@@ -69,13 +69,14 @@ pub(crate) fn decode_and_execute_sequences(
 /// Where a block's sequences are executed: output and literals with the positions reached in them.
 struct Executor<'a> {
     buf: &'a mut [u8],
-    /// Padded with `SLACK` bytes after `literals_len`.
+    /// The literals not copied yet, followed by `SLACK` bytes of padding. Shrinking the slice instead of
+    /// indexing it lets one check per sequence cover the reads from it.
     literals: &'a [u8],
+    /// How many literals the block has.
     literals_len: usize,
     /// Where the block starts in `buf`.
     start: usize,
     pos: usize,
-    lit: usize,
     hist: [u32; 3],
     /// The block's output may not go past this, the buffer only has `SLACK` bytes of room after it.
     limit: usize,
@@ -83,25 +84,28 @@ struct Executor<'a> {
     error: Option<ExecuteSequencesError>,
 }
 
-impl Executor<'_> {
+impl<'a> Executor<'a> {
     /// Returns false and sets `error` when the sequence is invalid.
     #[inline(always)]
     fn execute(&mut self, seq: Sequence) -> bool {
         let (ll, ml) = (seq.ll as usize, seq.ml as usize);
-        let (pos, lit) = (self.pos, self.lit);
+        let pos = self.pos;
+        let literals: &'a [u8] = self.literals;
         let literals_end = pos + ll;
         let end = literals_end + ml;
         // checked before writing
-        if lit + ll > self.literals_len || end > self.limit {
+        if literals.len() < ll + SLACK || end > self.limit {
+            let copied = self.literals_len + SLACK - literals.len();
             self.error = Some(length_error(
-                lit + ll,
+                copied + ll,
                 self.literals_len,
                 end - self.start,
                 self.limit - self.start,
             ));
             return false;
         }
-        self.buf[pos..pos + 16].copy_from_slice(&self.literals[lit..lit + 16]);
+        self.buf[pos..pos + 16].copy_from_slice(&literals[..16]);
+        self.literals = &literals[ll..];
 
         let offset = do_offset_history(seq.of, seq.ll, &mut self.hist) as usize;
         // also true for 0, which wraps
@@ -110,7 +114,7 @@ impl Executor<'_> {
             return false;
         }
         if ll > 16 || offset < 32 {
-            copy_uncommon(self.buf, pos, &self.literals[lit..lit + ll], offset, ml);
+            copy_uncommon(self.buf, pos, &literals[..ll], offset, ml);
         } else {
             // 32 byte chunks only read bytes that are final already; most matches fit in one, and going on
             // per 32 bytes keeps the exit of this loop predictable
@@ -125,7 +129,6 @@ impl Executor<'_> {
                 }
             }
         }
-        self.lit = lit + ll;
         self.pos = end;
         true
     }
