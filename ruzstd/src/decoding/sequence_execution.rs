@@ -192,64 +192,29 @@ pub fn execute_sequences(
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
+#[inline(always)]
 fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    let actual_offset = if lit_len > 0 {
-        match offset_value {
-            1..=3 => scratch[offset_value as usize - 1],
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
-    } else {
-        match offset_value {
-            1..=2 => scratch[offset_value as usize],
-            // A malformed dictionary can seed scratch[0] with 0; saturate so this
-            // resolves to 0 (rejected upstream as ZeroOffset) instead of
-            // underflowing. See #115.
-            3 => scratch[0].saturating_sub(1),
-            _ => {
-                //new offset
-                offset_value - 3
-            }
-        }
-    };
-
-    //update history
-    if lit_len > 0 {
-        match offset_value {
-            1 => {
-                //nothing
-            }
-            2 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-        }
-    } else {
-        match offset_value {
-            1 => {
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            2 => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-            _ => {
-                scratch[2] = scratch[1];
-                scratch[1] = scratch[0];
-                scratch[0] = actual_offset;
-            }
-        }
+    let [h0, h1, h2] = *scratch;
+    if offset_value > 3 {
+        let actual_offset = offset_value - 3;
+        *scratch = [actual_offset, h0, h1];
+        return actual_offset;
     }
-
+    // Repeat offsets, shifted by one when there are no literals: the last one is then the most recent
+    // offset minus one. A malformed dictionary can seed it with 0; saturate so this resolves to 0
+    // (rejected as ZeroOffset) instead of underflowing. See #115.
+    let idx = offset_value.wrapping_sub(1) + u32::from(lit_len == 0);
+    let actual_offset = match idx {
+        0 => h0,
+        1 => h1,
+        2 => h2,
+        _ => h0.saturating_sub(1),
+    };
+    *scratch = [
+        actual_offset,
+        if idx >= 1 { h0 } else { h1 },
+        if idx >= 2 { h1 } else { h2 },
+    ];
     actual_offset
 }
 
