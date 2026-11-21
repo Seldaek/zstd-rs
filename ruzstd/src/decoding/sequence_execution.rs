@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 
 /// Take the provided decoder and execute the sequences stored within
 /// Decodes and executes a block's sequences in one pass, for frames without a dictionary.
+// not inlined: its loop holds most registers, and compiles worse as part of the block decoder
 #[inline(never)]
 pub(crate) fn decode_and_execute_sequences(
     section: &SequencesHeader,
@@ -253,8 +254,8 @@ pub fn execute_sequences(
 /// before you get a functional number.
 #[inline(always)]
 fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    /// `a` if `cond`, else `b`. Whether an offset repeats is close to random, so this is spelled out
-    /// with masks to compile to conditional moves instead of branches.
+    /// `a` if `cond`, else `b`. Whether an offset repeats is close to random, so picking one is spelled out
+    /// with masks to compile to conditional moves instead of a branch per case.
     #[inline(always)]
     fn select(cond: bool, a: u32, b: u32) -> u32 {
         let mask = u32::from(cond).wrapping_neg();
