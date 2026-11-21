@@ -131,7 +131,8 @@ impl FSETable {
         if acc_log == 0 {
             return Err(FSETableError::AccLogIsZero);
         }
-        self.symbol_probabilities = probs.to_vec();
+        self.symbol_probabilities.clear();
+        self.symbol_probabilities.extend_from_slice(probs);
         self.accuracy_log = acc_log;
         self.build_decoding_table()
     }
@@ -196,25 +197,27 @@ impl FSETable {
             }
         }
 
-        // baselines and num_bits can only be calculated when all symbols have been spread
+        // baselines and num_bits can only be calculated when all symbols have been spread.
+        // The states of a symbol with probability p are numbered p..2p in table order; state number x reads
+        // enough bits to cover the table: accuracy_log - floor(log2(x)).
         self.symbol_counter.clear();
-        self.symbol_counter
-            .resize(self.symbol_probabilities.len(), 0);
-        for idx in 0..negative_idx {
-            let entry = &mut self.decode[idx];
-            let symbol = entry.symbol;
-            let prob = self.symbol_probabilities[symbol as usize];
-
-            let symbol_count = self.symbol_counter[symbol as usize];
-            let (bl, nb) = calc_baseline_and_numbits(table_size as u32, prob as u32, symbol_count);
-
-            //println!("symbol: {:2}, table: {}, prob: {:3}, count: {:3}, bl: {:3}, nb: {:2}", symbol, table_size, prob, symbol_count, bl, nb);
-
-            assert!(nb <= self.accuracy_log);
-            self.symbol_counter[symbol as usize] += 1;
-
-            entry.base_line = bl;
-            entry.num_bits = nb;
+        self.symbol_counter.extend(
+            self.symbol_probabilities
+                .iter()
+                .map(|&prob| prob.max(0) as u32),
+        );
+        let accuracy_log = u32::from(self.accuracy_log);
+        for entry in &mut self.decode[..negative_idx] {
+            let counter = &mut self.symbol_counter[entry.symbol as usize];
+            let state_number = *counter;
+            if state_number == 0 {
+                // probabilities that do not add up to the table size leave unused states
+                continue;
+            }
+            *counter += 1;
+            let num_bits = accuracy_log - state_number.ilog2();
+            entry.base_line = (state_number << num_bits) - table_size as u32;
+            entry.num_bits = num_bits as u8;
         }
         Ok(())
     }
@@ -337,6 +340,8 @@ fn next_position(mut p: usize, table_size: usize) -> usize {
     p
 }
 
+/// The spec's description of what `build_decoding_table` computes, kept to test it.
+#[cfg(test)]
 fn calc_baseline_and_numbits(
     num_states_total: u32,
     num_states_symbol: u32,
@@ -362,5 +367,35 @@ fn calc_baseline_and_numbits(
     } else {
         let index_shifted = state_number - num_double_width_state_slices;
         ((index_shifted * slice_width), num_bits as u8)
+    }
+}
+
+#[test]
+fn baselines_match_the_spec() {
+    for accuracy_log in 5..=9u8 {
+        let table_size = 1u32 << accuracy_log;
+        for prob in 1..=table_size {
+            // one symbol taking `prob` states, the rest are states of their own
+            let mut probs = alloc::vec![prob as i32];
+            probs.extend((prob..table_size).map(|_| 1));
+            if probs.len() > 256 {
+                continue;
+            }
+            let mut table = FSETable::new(255);
+            table
+                .build_from_probabilities(accuracy_log, &probs)
+                .unwrap();
+            let mut seen = 0;
+            for entry in &table.decode {
+                if entry.symbol == 0 {
+                    let expected = calc_baseline_and_numbits(table_size, prob, seen);
+                    assert_eq!((entry.base_line, entry.num_bits), expected);
+                    seen += 1;
+                } else {
+                    assert_eq!((entry.base_line, entry.num_bits), (0, accuracy_log));
+                }
+            }
+            assert_eq!(seen, prob);
+        }
     }
 }

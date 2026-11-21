@@ -93,67 +93,35 @@ pub fn decode_sequences(
     reader.finish()
 }
 
-/// Look up the provided state value from a literal length table predefined
-/// by the Zstandard reference document. Returns a tuple of (value, number of bits).
+/// The value a literal length code starts at and how many extra bits it reads.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
 fn lookup_ll_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=15 => (u32::from(code), 0),
-        16 => (16, 1),
-        17 => (18, 1),
-        18 => (20, 1),
-        19 => (22, 1),
-        20 => (24, 2),
-        21 => (28, 2),
-        22 => (32, 3),
-        23 => (40, 3),
-        24 => (48, 4),
-        25 => (64, 6),
-        26 => (128, 7),
-        27 => (256, 8),
-        28 => (512, 9),
-        29 => (1024, 10),
-        30 => (2048, 11),
-        31 => (4096, 12),
-        32 => (8192, 13),
-        33 => (16384, 14),
-        34 => (32768, 15),
-        35 => (65536, 16),
-        _ => unreachable!("Illegal literal length code was: {}", code),
-    }
+    const BITS: [u8; 36] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10,
+        11, 12, 13, 14, 15, 16,
+    ];
+    const BASE: [u32; 36] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48,
+        64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    ];
+    (BASE[code as usize], BITS[code as usize])
 }
 
-/// Look up the provided state value from a match length table predefined
-/// by the Zstandard reference document. Returns a tuple of (value, number of bits).
+/// The value a match length code starts at and how many extra bits it reads.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
 fn lookup_ml_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=31 => (u32::from(code) + 3, 0),
-        32 => (35, 1),
-        33 => (37, 1),
-        34 => (39, 1),
-        35 => (41, 1),
-        36 => (43, 2),
-        37 => (47, 2),
-        38 => (51, 3),
-        39 => (59, 3),
-        40 => (67, 4),
-        41 => (83, 4),
-        42 => (99, 5),
-        43 => (131, 7),
-        44 => (259, 8),
-        45 => (515, 9),
-        46 => (1027, 10),
-        47 => (2051, 11),
-        48 => (4099, 12),
-        49 => (8195, 13),
-        50 => (16387, 14),
-        51 => (32771, 15),
-        52 => (65539, 16),
-        _ => unreachable!("Illegal match length code was: {}", code),
-    }
+    const BITS: [u8; 53] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    ];
+    const BASE: [u32; 53] = [
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
+        1027, 2051, 4099, 8195, 16387, 32771, 65539,
+    ];
+    (BASE[code as usize], BITS[code as usize])
 }
 
 // This info is buried in the symbol compression mode table
@@ -489,7 +457,7 @@ fn maybe_update_fse_tables(
             vprintln!("Use predefined ll table");
             scratch.literal_lengths.build_from_probabilities(
                 LL_DEFAULT_ACC_LOG,
-                &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
+                &LITERALS_LENGTH_DEFAULT_DISTRIBUTION,
             )?;
             scratch.ll_rle = None;
         }
@@ -522,10 +490,9 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            scratch.offsets.build_from_probabilities(
-                OF_DEFAULT_ACC_LOG,
-                &Vec::from(&OFFSET_DEFAULT_DISTRIBUTION[..]),
-            )?;
+            scratch
+                .offsets
+                .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
             scratch.of_rle = None;
         }
         ModeType::Repeat => {
@@ -557,10 +524,9 @@ fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
-            scratch.match_lengths.build_from_probabilities(
-                ML_DEFAULT_ACC_LOG,
-                &Vec::from(&MATCH_LENGTH_DEFAULT_DISTRIBUTION[..]),
-            )?;
+            scratch
+                .match_lengths
+                .build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)?;
             scratch.ml_rle = None;
         }
         ModeType::Repeat => {
@@ -608,10 +574,7 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 fn test_ll_default() {
     let mut table = crate::fse::FSETable::new(MAX_LITERAL_LENGTH_CODE);
     table
-        .build_from_probabilities(
-            LL_DEFAULT_ACC_LOG,
-            &Vec::from(&LITERALS_LENGTH_DEFAULT_DISTRIBUTION[..]),
-        )
+        .build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
         .unwrap();
 
     #[cfg(feature = "std")]
