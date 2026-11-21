@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "hash")]
 use core::hash::Hasher;
 
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeBufferError;
 
 /// Bytes past `end` that wild copies may overwrite.
@@ -20,6 +21,8 @@ pub struct DecodeBuffer {
     pub dict_content: Vec<u8>,
 
     pub window_size: usize,
+    /// How much the current frame is expected to need, to size the buffer once.
+    expected_size: usize,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
@@ -39,6 +42,7 @@ impl DecodeBuffer {
             drained: 0,
             dict_content: Vec::new(),
             window_size,
+            expected_size: window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -47,6 +51,7 @@ impl DecodeBuffer {
 
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
+        self.expected_size = window_size;
         self.end = 0;
         self.drained = 0;
         self.dict_content.clear();
@@ -55,6 +60,11 @@ impl DecodeBuffer {
         {
             self.hash = twox_hash::XxHash64::with_seed(0);
         }
+    }
+
+    /// Sizes the next allocation for a frame expected to keep this many bytes of history.
+    pub fn set_expected_size(&mut self, size: usize) {
+        self.expected_size = size;
     }
 
     /// Bytes decoded but not drained yet.
@@ -76,16 +86,23 @@ impl DecodeBuffer {
         let kept = self.end - keep_from;
         let needed = kept + amount + SLACK;
         // only move what frees at least half as much space, amortized to two extra copies per byte
-        if keep_from > 0 && keep_from >= kept / 2 {
+        if keep_from >= kept / 2 && self.buf.len() >= needed {
             self.buf.copy_within(keep_from..self.end, 0);
-            self.end -= keep_from;
-            self.drained -= keep_from;
+        } else {
+            // a fresh zeroed allocation is provided lazily by the OS, unlike zeroing the grown part in place;
+            // sized for the whole frame first, so most frames allocate once
+            let first = self.expected_size + 2 * MAX_BLOCK_SIZE as usize + SLACK;
+            let grown = if self.buf.len() < first {
+                first
+            } else {
+                2 * needed
+            };
+            let mut buf = alloc::vec![0u8; grown.max(needed)];
+            buf[..kept].copy_from_slice(&self.buf[keep_from..self.end]);
+            self.buf = buf;
         }
-        if self.buf.len() - self.end < amount + SLACK {
-            // twice what is kept, so the next move frees at least as much as it copies
-            let size = (2 * needed).max(self.end + amount + SLACK).max(1 << 16);
-            self.buf.resize(size, 0);
-        }
+        self.end -= keep_from;
+        self.drained -= keep_from;
     }
 
     /// Writes `amount` bytes at `end` with `write`, which may write up to `SLACK` bytes more.
@@ -254,27 +271,32 @@ impl DecodeBuffer {
 /// the copy repeats the bytes it is writing. May write up to `SLACK` bytes past `end + len`.
 #[inline(always)]
 pub(crate) fn copy_match(buf: &mut [u8], end: usize, offset: usize, len: usize) {
-    let src = end - offset;
-    if offset >= 16 && len <= SLACK {
-        // each 16 byte chunk only reads bytes that are final already
-        buf.copy_within(src..src + 16, end);
-        if len > 16 {
-            buf.copy_within(src + 16..src + 32, end + 16);
-        }
-    } else if offset >= len {
-        buf.copy_within(src..src + len, end);
-    } else if len <= 16 {
-        for i in 0..len {
-            buf[end + i] = buf[src + i];
+    if offset >= 16 {
+        // 16 byte chunks only read bytes that are final already
+        let src = end - offset;
+        let mut i = 0;
+        while i < len {
+            buf.copy_within(src + i..src + i + 16, end + i);
+            i += 16;
         }
     } else {
-        // the pattern repeats every `offset` bytes, so the copied part can double each time
-        let mut copied = 0;
-        while copied < len {
-            let chunk = (offset + copied).min(len - copied);
-            buf.copy_within(src..src + chunk, end + copied);
-            copied += chunk;
-        }
+        copy_match_short_offset(buf, end, offset, len);
+    }
+}
+
+/// The pattern repeats every `offset` bytes, so after writing the first multiple of `offset` that is at least
+/// 16 bytes long, the rest copies in 16 byte chunks from that distance.
+#[inline(never)]
+fn copy_match_short_offset(buf: &mut [u8], end: usize, offset: usize, len: usize) {
+    let distance = offset * 16usize.div_ceil(offset);
+    let head = len.min(distance);
+    for i in end..end + head {
+        buf[i] = buf[i - offset];
+    }
+    let mut i = end + distance;
+    while i < end + len {
+        buf.copy_within(i - distance..i - distance + 16, i);
+        i += 16;
     }
 }
 

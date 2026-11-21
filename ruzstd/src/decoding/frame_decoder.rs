@@ -99,6 +99,21 @@ pub enum BlockDecodingStrategy {
     UptoBytes(usize),
 }
 
+/// The history a frame needs: its window, or its whole content if that is declared and smaller.
+/// Without a declared size, large windows are grown into instead of allocated up front.
+fn expected_size(header: &frame::FrameHeader, window_size: u64) -> usize {
+    let declared = header
+        .descriptor
+        .frame_content_size_bytes()
+        .is_ok_and(|n| n > 0);
+    let size = if declared {
+        window_size.min(header.frame_content_size())
+    } else {
+        window_size.min(1 << 22)
+    };
+    size as usize
+}
+
 impl FrameDecoderState {
     fn new(
         source: impl Read,
@@ -107,11 +122,15 @@ impl FrameDecoderState {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
+        let mut decoder_scratch = DecoderScratch::new(window_size as usize);
+        decoder_scratch
+            .buffer
+            .set_expected_size(expected_size(&frame, window_size));
         Ok(FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
             block_counter: 0,
-            decoder_scratch: DecoderScratch::new(window_size as usize),
+            decoder_scratch,
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
@@ -127,6 +146,9 @@ impl FrameDecoderState {
         self.frame_finished = false;
         self.block_counter = 0;
         self.decoder_scratch.reset(window_size as usize);
+        self.decoder_scratch
+            .buffer
+            .set_expected_size(expected_size(&self.frame_header, window_size));
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;

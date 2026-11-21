@@ -12,12 +12,12 @@ use crate::fse::FSETable;
 use alloc::vec::Vec;
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
-pub fn decode_sequences(
+/// Reads the table descriptions and positions a reader on the sequences of `source`.
+pub(crate) fn read_sequences<'a>(
     section: &SequencesHeader,
-    source: &[u8],
-    scratch: &mut FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
+    source: &'a [u8],
+    scratch: &'a mut FSEScratch,
+) -> Result<SequenceReader<'a>, DecodeSequenceError> {
     let bytes_read = maybe_update_fse_tables(section, source, scratch)?;
 
     vprintln!("Updating tables used {} bytes", bytes_read);
@@ -69,7 +69,27 @@ pub fn decode_sequences(
         }
     }
     let [ll, ml, of] = &scratch.seq_tables;
-    decode_sequences_with_tables(section.num_sequences, &mut br, ll, ml, of, target)
+    Ok(SequenceReader::new(
+        br,
+        [ll, ml, of],
+        section.num_sequences as usize,
+    ))
+}
+
+/// Decode the provided source as a series of sequences into the supplied `target`.
+pub fn decode_sequences(
+    section: &SequencesHeader,
+    source: &[u8],
+    scratch: &mut FSEScratch,
+    target: &mut Vec<Sequence>,
+) -> Result<(), DecodeSequenceError> {
+    let mut reader = read_sequences(section, source, scratch)?;
+    target.clear();
+    target.reserve(section.num_sequences as usize);
+    while let Some(seq) = reader.next() {
+        target.push(seq);
+    }
+    reader.finish()
 }
 
 /// Look up the provided state value from a literal length table predefined
@@ -232,40 +252,61 @@ fn decode_one<const UNCHECKED: bool>(
     }
 }
 
-fn decode_sequences_with_tables(
-    num_sequences: u32,
-    br: &mut BitReaderReversed<'_>,
-    ll: &SeqTable,
-    ml: &SeqTable,
-    of: &SeqTable,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let tables = [&ll.entries[..], &ml.entries[..], &of.entries[..]];
-    let mut states = [0u32; 3];
-    states[0] = br.get_bits(ll.accuracy_log) as u32;
-    states[2] = br.get_bits(of.accuracy_log) as u32;
-    states[1] = br.get_bits(ml.accuracy_log) as u32;
+/// Decodes the sequences of a block one by one.
+pub(crate) struct SequenceReader<'a> {
+    br: BitReaderReversed<'a>,
+    states: [u32; 3],
+    tables: [&'a [SeqEntry]; 3],
+    remaining: usize,
+}
 
-    target.clear();
-    target.reserve(num_sequences as usize);
-    let num = num_sequences as usize;
-    let mut i = 0;
-    // a sequence reads at most 63 + 26 bits, so 16 bytes left in the stream make the unchecked refills safe
-    while i + 1 < num && br.byte_idx() > 16 {
-        br.refill_unchecked();
-        target.push(decode_one::<true>(br, &mut states, tables, false));
-        i += 1;
-    }
-    while i < num {
-        br.refill();
-        target.push(decode_one::<false>(br, &mut states, tables, i + 1 == num));
-        i += 1;
+impl<'a> SequenceReader<'a> {
+    fn new(mut br: BitReaderReversed<'a>, tables: [&'a SeqTable; 3], num_sequences: usize) -> Self {
+        let mut states = [0u32; 3];
+        states[0] = br.get_bits(tables[0].accuracy_log) as u32;
+        states[2] = br.get_bits(tables[2].accuracy_log) as u32;
+        states[1] = br.get_bits(tables[1].accuracy_log) as u32;
+        SequenceReader {
+            br,
+            states,
+            tables: [&tables[0].entries, &tables[1].entries, &tables[2].entries],
+            remaining: num_sequences,
+        }
     }
 
-    match br.bits_remaining() {
-        0 => Ok(()),
-        r if r < 0 => Err(DecodeSequenceError::NotEnoughBytesForNumSequences),
-        r => Err(DecodeSequenceError::ExtraBits { bits_remaining: r }),
+    #[inline(always)]
+    pub(crate) fn next(&mut self) -> Option<Sequence> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        // a sequence reads at most 63 + 26 bits, so 16 bytes left in the stream make the unchecked refills safe
+        Some(if self.br.byte_idx() > 16 {
+            self.br.refill_unchecked();
+            decode_one::<true>(
+                &mut self.br,
+                &mut self.states,
+                self.tables,
+                self.remaining == 0,
+            )
+        } else {
+            self.br.refill();
+            decode_one::<false>(
+                &mut self.br,
+                &mut self.states,
+                self.tables,
+                self.remaining == 0,
+            )
+        })
+    }
+
+    /// Checks that the bitstream ended exactly with the last sequence.
+    pub(crate) fn finish(self) -> Result<(), DecodeSequenceError> {
+        match self.br.bits_remaining() {
+            0 => Ok(()),
+            r if r < 0 => Err(DecodeSequenceError::NotEnoughBytesForNumSequences),
+            r => Err(DecodeSequenceError::ExtraBits { bits_remaining: r }),
+        }
     }
 }
 
