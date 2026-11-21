@@ -99,17 +99,20 @@ pub enum BlockDecodingStrategy {
     UptoBytes(usize),
 }
 
-/// The history a frame needs: its window, or its whole content if that is declared and smaller.
+/// What to size the buffer for: the window, or the whole content if that is declared and no more than the
+/// two windows the buffer grows to anyway, so it is never moved or copied.
 /// Without a declared size, large windows are grown into instead of allocated up front.
 fn expected_size(header: &frame::FrameHeader, window_size: u64) -> usize {
     let declared = header
         .descriptor
         .frame_content_size_bytes()
         .is_ok_and(|n| n > 0);
-    let size = if declared {
-        window_size.min(header.frame_content_size())
-    } else {
+    let size = if !declared {
         window_size.min(1 << 22)
+    } else if header.frame_content_size() <= window_size.saturating_mul(2) {
+        header.frame_content_size()
+    } else {
+        window_size
     };
     size as usize
 }
