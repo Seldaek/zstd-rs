@@ -194,26 +194,30 @@ pub fn execute_sequences(
 /// before you get a functional number.
 #[inline(always)]
 fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
-    let [h0, h1, h2] = *scratch;
-    if offset_value > 3 {
-        let actual_offset = offset_value - 3;
-        *scratch = [actual_offset, h0, h1];
-        return actual_offset;
+    /// `a` if `cond`, else `b`. Whether an offset repeats is close to random, so this is spelled out
+    /// with masks to compile to conditional moves instead of branches.
+    #[inline(always)]
+    fn select(cond: bool, a: u32, b: u32) -> u32 {
+        let mask = u32::from(cond).wrapping_neg();
+        (a & mask) | (b & !mask)
     }
-    // Repeat offsets, shifted by one when there are no literals: the last one is then the most recent
+
+    let [h0, h1, h2] = *scratch;
+    let repeat = offset_value <= 3;
+    // Which repeat offset: shifted by one when there are no literals, the last one is then the most recent
     // offset minus one. A malformed dictionary can seed it with 0; saturate so this resolves to 0
     // (rejected as ZeroOffset) instead of underflowing. See #115.
     let idx = offset_value.wrapping_sub(1) + u32::from(lit_len == 0);
-    let actual_offset = match idx {
-        0 => h0,
-        1 => h1,
-        2 => h2,
-        _ => h0.saturating_sub(1),
-    };
+    let repeated = select(
+        idx < 2,
+        select(idx == 0, h0, h1),
+        select(idx == 2, h2, h0.saturating_sub(1)),
+    );
+    let actual_offset = select(repeat, repeated, offset_value.wrapping_sub(3));
     *scratch = [
         actual_offset,
-        if idx >= 1 { h0 } else { h1 },
-        if idx >= 2 { h1 } else { h2 },
+        select(repeat && idx == 0, h1, h0),
+        select(repeat && idx < 2, h2, h1),
     ];
     actual_offset
 }
