@@ -3,7 +3,6 @@ use core::convert::TryInto;
 /// Zstandard encodes some types of data in a way that the data must be read
 /// back to front to decode it properly. `BitReaderReversed` provides a
 /// convenient interface to do that.
-#[derive(Clone)]
 pub struct BitReaderReversed<'s> {
     /// The index of the last read byte in the source.
     index: usize,
@@ -33,6 +32,11 @@ impl<'s> BitReaderReversed<'s> {
     #[inline(always)]
     pub fn byte_idx(&self) -> usize {
         self.index
+    }
+
+    /// The data this reads from.
+    pub fn source(&self) -> &'s [u8] {
+        self.source
     }
 
     pub fn new(source: &'s [u8]) -> BitReaderReversed<'s> {

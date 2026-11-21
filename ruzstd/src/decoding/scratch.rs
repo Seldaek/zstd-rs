@@ -5,6 +5,7 @@ use super::decode_buffer::DecodeBuffer;
 use crate::decoding::dictionary::Dictionary;
 use crate::fse::FSETable;
 use crate::huff0::HuffmanTable;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::blocks::sequence_section::{
@@ -114,14 +115,19 @@ pub struct FSEScratch {
 /// One FSE state with its symbol resolved to the value and extra bits it stands for.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SeqEntry {
-    pub base_line: u32,
     pub value: u32,
+    // 8 bytes per entry: there are at most 2^9 states
+    pub base_line: u16,
     pub num_bits: u8,
     pub extra_bits: u8,
 }
 
+/// The most states a sequence table can have.
+pub(crate) const SEQ_TABLE_SIZE: usize = 1 << 9;
+
 pub(crate) struct SeqTable {
-    pub entries: Vec<SeqEntry>,
+    /// Of a fixed size so states index it with a mask instead of a bounds check.
+    pub entries: Box<[SeqEntry; SEQ_TABLE_SIZE]>,
     pub accuracy_log: u8,
     /// Needs rebuilding from the FSE table or RLE symbol.
     pub stale: bool,
@@ -130,7 +136,7 @@ pub(crate) struct SeqTable {
 impl Default for SeqTable {
     fn default() -> Self {
         SeqTable {
-            entries: Vec::new(),
+            entries: Box::new([SeqEntry::default(); SEQ_TABLE_SIZE]),
             accuracy_log: 0,
             stale: true,
         }

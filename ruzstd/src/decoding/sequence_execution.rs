@@ -34,16 +34,20 @@ pub(crate) fn decode_and_execute_sequences(
             lit: 0,
             hist,
             limit: start + max_block_decoded_len,
+            error: None,
         };
-        let result = reader.for_each_fast(|seq| exec.execute(seq));
-        let result = result.and_then(|()| {
+        reader.for_each_fast(|seq| exec.execute(seq));
+        if exec.error.is_none() {
             while let Some(seq) = reader.next() {
-                exec.execute(seq)?;
+                if !exec.execute(seq) {
+                    break;
+                }
             }
-            Ok(())
-        });
+        }
         hist = exec.hist;
-        result?;
+        if let Some(error) = exec.error {
+            return Err(error);
+        }
         let (pos, lit) = (exec.pos, exec.lit);
         let rest = literals_len - lit;
         if pos + rest > exec.limit {
@@ -75,50 +79,97 @@ struct Executor<'a> {
     hist: [u32; 3],
     /// The block's output may not go past this, the buffer only has `SLACK` bytes of room after it.
     limit: usize,
+    /// Why `execute` returned false.
+    error: Option<ExecuteSequencesError>,
 }
 
 impl Executor<'_> {
+    /// Returns false and sets `error` when the sequence is invalid.
     #[inline(always)]
-    fn execute(&mut self, seq: Sequence) -> Result<(), ExecuteSequencesError> {
+    fn execute(&mut self, seq: Sequence) -> bool {
         let (ll, ml) = (seq.ll as usize, seq.ml as usize);
         let (pos, lit) = (self.pos, self.lit);
-        if lit + ll > self.literals_len {
-            return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
-                wanted: lit + ll,
-                have: self.literals_len,
-            });
-        }
+        let literals_end = pos + ll;
+        let end = literals_end + ml;
         // checked before writing
-        if pos + ll + ml > self.limit {
-            return Err(ExecuteSequencesError::TooManyBytesGenerated {
-                max: self.limit - self.start,
-                decoded: pos + ll + ml - self.start,
-            });
+        if lit + ll > self.literals_len || end > self.limit {
+            self.error = Some(length_error(
+                lit + ll,
+                self.literals_len,
+                end - self.start,
+                self.limit - self.start,
+            ));
+            return false;
         }
         self.buf[pos..pos + 16].copy_from_slice(&self.literals[lit..lit + 16]);
-        if ll > 16 {
-            self.buf[pos + 16..pos + ll].copy_from_slice(&self.literals[lit + 16..lit + ll]);
-        }
-        let pos = pos + ll;
-        self.lit = lit + ll;
-        self.pos = pos;
 
         let offset = do_offset_history(seq.of, seq.ll, &mut self.hist) as usize;
-        if offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset);
+        // also true for 0, which wraps
+        if offset.wrapping_sub(1) >= literals_end {
+            self.error = Some(offset_error(offset, literals_end));
+            return false;
         }
-        if offset > pos {
-            return Err(ExecuteSequencesError::DecodebufferError(
-                DecodeBufferError::OffsetTooBig {
-                    offset,
-                    buf_len: pos,
-                },
-            ));
+        if ll > 16 || offset < 32 {
+            copy_uncommon(self.buf, pos, &self.literals[lit..lit + ll], offset, ml);
+        } else {
+            // 32 byte chunks only read bytes that are final already; most matches fit in one, and going on
+            // per 32 bytes keeps the exit of this loop predictable
+            let src = literals_end - offset;
+            let mut i = 0;
+            loop {
+                self.buf
+                    .copy_within(src + i..src + i + 32, literals_end + i);
+                i += 32;
+                if i >= ml {
+                    break;
+                }
+            }
         }
-        copy_match(self.buf, pos, offset, ml);
-        self.pos = pos + ml;
-        Ok(())
+        self.lit = lit + ll;
+        self.pos = end;
+        true
     }
+}
+
+#[cold]
+#[inline(never)]
+fn length_error(
+    literals_wanted: usize,
+    literals_len: usize,
+    decoded: usize,
+    max: usize,
+) -> ExecuteSequencesError {
+    if literals_wanted > literals_len {
+        ExecuteSequencesError::NotEnoughBytesForSequence {
+            wanted: literals_wanted,
+            have: literals_len,
+        }
+    } else {
+        ExecuteSequencesError::TooManyBytesGenerated { max, decoded }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn offset_error(offset: usize, buf_len: usize) -> ExecuteSequencesError {
+    if offset == 0 {
+        ExecuteSequencesError::ZeroOffset
+    } else {
+        ExecuteSequencesError::DecodebufferError(DecodeBufferError::OffsetTooBig {
+            offset,
+            buf_len,
+        })
+    }
+}
+
+/// Long literals and short offsets are rare. Keeping their calls out of the loop executing sequences, and
+/// cold, lets it keep its state in registers.
+#[cold]
+#[inline(never)]
+fn copy_uncommon(buf: &mut [u8], pos: usize, literals: &[u8], offset: usize, ml: usize) {
+    let literals_end = pos + literals.len();
+    buf[pos..literals_end].copy_from_slice(literals);
+    copy_match(buf, literals_end, offset, ml);
 }
 
 /// Executes the sequences decoded into the scratch, where matches may also reach into the dictionary.

@@ -1,7 +1,7 @@
 use super::super::blocks::sequence_section::ModeType;
 use super::super::blocks::sequence_section::Sequence;
 use super::super::blocks::sequence_section::SequencesHeader;
-use super::scratch::{FSEScratch, SeqEntry, SeqTable};
+use super::scratch::{FSEScratch, SeqEntry, SeqTable, SEQ_TABLE_SIZE};
 use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
@@ -10,6 +10,7 @@ use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::FSEDecoderError;
 use crate::fse::FSETable;
 use alloc::vec::Vec;
+use core::convert::{TryFrom, TryInto};
 
 /// Decode the provided source as a series of sequences into the supplied `target`.
 /// Reads the table descriptions and positions a reader on the sequences of `source`.
@@ -171,35 +172,35 @@ fn build_seq_table(
     lookup: impl Fn(u8) -> (u32, u8),
     max_code: u8,
 ) -> Result<(), DecodeSequenceError> {
-    out.entries.clear();
     if let Some(code) = rle {
         // a single state that reads no bits
         let (value, extra_bits) = lookup(code);
-        out.entries.push(SeqEntry {
+        out.entries[0] = SeqEntry {
             base_line: 0,
             value,
             num_bits: 0,
             extra_bits,
-        });
+        };
         out.accuracy_log = 0;
         return Ok(());
     }
     if fse.accuracy_log == 0 {
         return Err(FSEDecoderError::TableIsUninitialized.into());
     }
-    for e in &fse.decode {
+    debug_assert!(fse.decode.len() <= SEQ_TABLE_SIZE);
+    for (e, out) in fse.decode.iter().zip(out.entries.iter_mut()) {
         if e.symbol > max_code {
             return Err(DecodeSequenceError::UnsupportedOffset {
                 offset_code: e.symbol,
             });
         }
         let (value, extra_bits) = lookup(e.symbol);
-        out.entries.push(SeqEntry {
-            base_line: e.base_line,
+        *out = SeqEntry {
+            base_line: e.base_line as u16,
             value,
             num_bits: e.num_bits,
             extra_bits,
-        });
+        };
     }
     out.accuracy_log = fse.accuracy_log;
     Ok(())
@@ -224,12 +225,12 @@ fn refill<const UNCHECKED: bool>(br: &mut BitReaderReversed<'_>) {
 fn decode_one<const UNCHECKED: bool>(
     br: &mut BitReaderReversed<'_>,
     states: &mut [u32; 3],
-    tables: [&[SeqEntry]; 3],
+    tables: [&[SeqEntry; SEQ_TABLE_SIZE]; 3],
     last: bool,
 ) -> Sequence {
-    let ll = tables[0][states[0] as usize];
-    let ml = tables[1][states[1] as usize];
-    let of = tables[2][states[2] as usize];
+    let ll = tables[0][states[0] as usize % SEQ_TABLE_SIZE];
+    let ml = tables[1][states[1] as usize % SEQ_TABLE_SIZE];
+    let of = tables[2][states[2] as usize % SEQ_TABLE_SIZE];
     let extra = of.extra_bits + ml.extra_bits + ll.extra_bits;
     let of_add = br.get_bits_unchecked(of.extra_bits);
     let ml_add = br.get_bits_unchecked(ml.extra_bits);
@@ -241,9 +242,9 @@ fn decode_one<const UNCHECKED: bool>(
         if extra > BITS_AFTER_REFILL - MAX_STATE_BITS {
             refill::<UNCHECKED>(br);
         }
-        states[0] = ll.base_line + br.get_bits_unchecked(ll.num_bits) as u32;
-        states[1] = ml.base_line + br.get_bits_unchecked(ml.num_bits) as u32;
-        states[2] = of.base_line + br.get_bits_unchecked(of.num_bits) as u32;
+        states[0] = u32::from(ll.base_line) + br.get_bits_unchecked(ll.num_bits) as u32;
+        states[1] = u32::from(ml.base_line) + br.get_bits_unchecked(ml.num_bits) as u32;
+        states[2] = u32::from(of.base_line) + br.get_bits_unchecked(of.num_bits) as u32;
     }
     Sequence {
         ll: ll.value + ll_add as u32,
@@ -252,11 +253,87 @@ fn decode_one<const UNCHECKED: bool>(
     }
 }
 
+/// `FastBits` holds at least this many bits after a refill.
+const FAST_BITS_AFTER_REFILL: u32 = 56;
+
+/// Reads the bitstream like [BitReaderReversed], for the part that is at least 16 bytes away from its start.
+///
+/// The unread bits are kept at the top of `buf`, and a refill ors in the bytes before `pos` below them. The
+/// position of that read only depends on the previous refill, so unlike reloading the whole container,
+/// it does not wait for the bits consumed since to be known.
+struct FastBits<'a> {
+    source: &'a [u8],
+    /// Bytes of `source` not in `buf` yet.
+    pos: usize,
+    buf: u64,
+    /// Valid bits in `buf`. Below them are the next bits of the stream already, or zeroes.
+    count: u32,
+}
+
+impl<'a> FastBits<'a> {
+    #[inline(always)]
+    fn new(br: &BitReaderReversed<'a>) -> Option<Self> {
+        let unread = usize::try_from(br.bits_remaining()).ok()?;
+        let source = br.source();
+        let pos = unread.div_ceil(8);
+        if pos < 16 || pos > source.len() {
+            return None;
+        }
+        let mut bits = FastBits {
+            source,
+            pos,
+            buf: 0,
+            count: 0,
+        };
+        bits.refill();
+        // the bits of the last byte that were read already
+        bits.consume((pos * 8 - unread) as u32);
+        Some(bits)
+    }
+
+    /// A sequence refills at most twice, each one reads the 8 bytes before `pos` and moves it by up to 7.
+    #[inline(always)]
+    fn can_refill_twice(&self) -> bool {
+        self.pos >= 16
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        let word = u64::from_le_bytes(self.source[self.pos - 8..self.pos].try_into().unwrap());
+        self.buf |= word >> self.count;
+        self.pos -= ((63 - self.count) >> 3) as usize;
+        self.count |= 56;
+    }
+
+    /// The `n` bits found after skipping `skip` bits. Branchless, also for `n == 0`.
+    #[inline(always)]
+    fn peek_at(&self, skip: u32, n: u32) -> u64 {
+        debug_assert!(skip + n <= self.count && n < 64);
+        ((self.buf << skip) >> 1) >> (63 - n)
+    }
+
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        self.buf <<= n;
+        self.count -= n;
+    }
+
+    /// A reader positioned on the same bit.
+    #[inline(always)]
+    fn into_reader(self) -> BitReaderReversed<'a> {
+        let unread = self.pos * 8 + self.count as usize;
+        let bytes = unread.div_ceil(8);
+        let mut br = BitReaderReversed::new(&self.source[..bytes]);
+        br.get_bits((bytes * 8 - unread) as u8);
+        br
+    }
+}
+
 /// Decodes the sequences of a block one by one.
 pub(crate) struct SequenceReader<'a> {
     br: BitReaderReversed<'a>,
     states: [u32; 3],
-    tables: [&'a [SeqEntry]; 3],
+    tables: [&'a [SeqEntry; SEQ_TABLE_SIZE]; 3],
     remaining: usize,
 }
 
@@ -300,30 +377,60 @@ impl<'a> SequenceReader<'a> {
         })
     }
 
-    /// Runs `f` on sequences for as long as they can be decoded without checked refills, leaving at least the
-    /// last one to `next`. Works on copies of the state so it stays in registers.
+    /// Runs `f` on sequences for as long as they can be decoded without checked refills and it returns true,
+    /// leaving at least the last one to `next`. Works on copies of the state so it stays in registers.
     #[inline(always)]
-    pub(crate) fn for_each_fast<E>(
-        &mut self,
-        mut f: impl FnMut(Sequence) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let mut br = self.br.clone();
-        let mut states = self.states;
+    pub(crate) fn for_each_fast(&mut self, mut f: impl FnMut(Sequence) -> bool) {
+        let Some(mut bits) = FastBits::new(&self.br) else {
+            return;
+        };
+        let [ll_table, ml_table, of_table] = self.tables;
+        let [mut ll_state, mut ml_state, mut of_state] = self.states;
         let mut remaining = self.remaining;
-        let mut result = Ok(());
-        while remaining > 1 && br.byte_idx() > 16 {
+        while remaining > 1 && bits.can_refill_twice() {
             remaining -= 1;
-            br.refill_unchecked();
-            let seq = decode_one::<true>(&mut br, &mut states, self.tables, false);
-            if let Err(e) = f(seq) {
-                result = Err(e);
+            bits.refill();
+            let ll = ll_table[ll_state as usize % SEQ_TABLE_SIZE];
+            let ml = ml_table[ml_state as usize % SEQ_TABLE_SIZE];
+            let of = of_table[of_state as usize % SEQ_TABLE_SIZE];
+            let (ll_extra, ml_extra, of_extra) = (
+                u32::from(ll.extra_bits),
+                u32::from(ml.extra_bits),
+                u32::from(of.extra_bits),
+            );
+            let (ll_bits, ml_bits, of_bits) = (
+                u32::from(ll.num_bits),
+                u32::from(ml.num_bits),
+                u32::from(of.num_bits),
+            );
+            let of_add = bits.peek_at(0, of_extra);
+            let ml_add = bits.peek_at(of_extra, ml_extra);
+            let mut at = of_extra + ml_extra;
+            if at + ll_extra > FAST_BITS_AFTER_REFILL - MAX_STATE_BITS as u32 {
+                bits.consume(at);
+                bits.refill();
+                at = 0;
+            }
+            let ll_add = bits.peek_at(at, ll_extra);
+            let ll_at = at + ll_extra;
+            let ml_at = ll_at + ll_bits;
+            let of_at = ml_at + ml_bits;
+            ll_state = u32::from(ll.base_line) + bits.peek_at(ll_at, ll_bits) as u32;
+            ml_state = u32::from(ml.base_line) + bits.peek_at(ml_at, ml_bits) as u32;
+            of_state = u32::from(of.base_line) + bits.peek_at(of_at, of_bits) as u32;
+            bits.consume(of_at + of_bits);
+            let seq = Sequence {
+                ll: ll.value + ll_add as u32,
+                ml: ml.value + ml_add as u32,
+                of: of.value + of_add as u32,
+            };
+            if !f(seq) {
                 break;
             }
         }
-        self.br = br;
-        self.states = states;
+        self.br = bits.into_reader();
+        self.states = [ll_state, ml_state, of_state];
         self.remaining = remaining;
-        result
     }
 
     /// Checks that the bitstream ended exactly with the last sequence.
