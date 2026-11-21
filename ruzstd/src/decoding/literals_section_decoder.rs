@@ -96,15 +96,13 @@ fn decompress_literals(
 
         // each of the first three streams decodes to exactly a quarter (rounded up), the last one to the rest
         let segment = regenerated.div_ceil(4);
-        let starts = [0, jump1, jump2, jump3];
         let mut readers = [
             init_reader(&source[..jump1])?,
             init_reader(&source[jump1..jump2])?,
             init_reader(&source[jump2..jump3])?,
             init_reader(&source[jump3..])?,
         ];
-        let decoded =
-            decode_four_streams(table, max_bits, source, starts, &mut readers, out, segment);
+        let decoded = decode_four_streams(table, max_bits, &mut readers, out, segment);
         for (k, br) in readers.iter_mut().enumerate() {
             let end = (segment * (k + 1)).min(regenerated);
             decode_stream_rest(br, &mut out[segment * k + decoded..end], table, max_bits)?;
@@ -148,14 +146,12 @@ fn init_reader(stream: &[u8]) -> Result<BitReaderReversed<'_>, DecompressLiteral
     Ok(br)
 }
 
-/// Decodes the four streams of `source` in lockstep for as long as all of them can refill unchecked, each to
-/// its `segment` of `out`. Leaves `readers` after the last symbol decoded and returns how many each stream
+/// Decodes the four streams in lockstep for as long as all of them can refill unchecked, each to its
+/// `segment` of `out`. Leaves `readers` after the last symbol decoded and returns how many each stream
 /// decoded.
 fn decode_four_streams<'a>(
     table: &[Entry],
     max_bits: u8,
-    source: &'a [u8],
-    starts: [usize; 4],
     readers: &mut [BitReaderReversed<'a>; 4],
     out: &mut [u8],
     segment: usize,
@@ -163,10 +159,10 @@ fn decode_four_streams<'a>(
     /// Five symbols of up to 11 bits fit in the 56 bits a refill provides.
     const SYMBOLS: usize = 5;
     let (Some(a), Some(b), Some(c), Some(d)) = (
-        FastBits::new(source, starts[0], &readers[0]),
-        FastBits::new(source, starts[1], &readers[1]),
-        FastBits::new(source, starts[2], &readers[2]),
-        FastBits::new(source, starts[3], &readers[3]),
+        FastBits::new(&readers[0]),
+        FastBits::new(&readers[1]),
+        FastBits::new(&readers[2]),
+        FastBits::new(&readers[3]),
     ) else {
         return 0;
     };
@@ -185,15 +181,15 @@ fn decode_four_streams<'a>(
     let mut decoded = 0;
     loop {
         let mut rounds = last_segment.saturating_sub(decoded + 8 - SYMBOLS) / SYMBOLS;
-        for (bits, &start) in bits.iter().zip(&starts) {
-            rounds = rounds.min(bits.refills_from(start));
+        for bits in &bits {
+            rounds = rounds.min(bits.refills_left());
         }
         if rounds == 0 {
             break;
         }
         for _ in 0..rounds {
             for (k, bits) in bits.iter_mut().enumerate() {
-                bits.refill(source);
+                bits.refill();
                 let mut symbols = 0u64;
                 for i in 0..SYMBOLS {
                     let entry = table[bits.peek_top(shift) as usize & mask];
@@ -208,10 +204,10 @@ fn decode_four_streams<'a>(
     }
     let [a, b, c, d] = bits;
     *readers = [
-        a.into_reader(source, starts[0]),
-        b.into_reader(source, starts[1]),
-        c.into_reader(source, starts[2]),
-        d.into_reader(source, starts[3]),
+        a.into_reader(),
+        b.into_reader(),
+        c.into_reader(),
+        d.into_reader(),
     ];
     decoded
 }

@@ -279,17 +279,16 @@ impl<'a> SequenceReader<'a> {
     /// leaving at least the last one to `next`. Works on copies of the state so it stays in registers.
     #[inline(always)]
     pub(crate) fn for_each_fast(&mut self, mut f: impl FnMut(Sequence) -> bool) {
-        let source = self.br.source();
-        let Some(mut bits) = FastBits::new(source, 0, &self.br) else {
+        let Some(mut bits) = FastBits::new(&self.br) else {
             return;
         };
         let table = self.table;
         let [mut ll_state, mut ml_state, mut of_state] = self.states;
         let mut remaining = self.remaining;
         // a sequence refills at most twice
-        while remaining > 1 && bits.can_refill(0, 2) {
+        while remaining > 1 && bits.can_refill(2) {
             remaining -= 1;
-            bits.refill(source);
+            bits.refill();
             let ll = table[ll_state as usize % SEQ_TABLES_SIZE];
             let ml = table[ml_state as usize % SEQ_TABLES_SIZE];
             let of = table[of_state as usize % SEQ_TABLES_SIZE];
@@ -308,7 +307,7 @@ impl<'a> SequenceReader<'a> {
             let mut at = of_extra + ml_extra;
             if at + ll_extra > FastBits::AFTER_REFILL - MAX_STATE_BITS as u32 {
                 bits.consume(at);
-                bits.refill(source);
+                bits.refill();
                 at = 0;
             }
             let ll_add = bits.peek_at(at, ll_extra);
@@ -328,7 +327,7 @@ impl<'a> SequenceReader<'a> {
                 break;
             }
         }
-        self.br = bits.into_reader(source, 0);
+        self.br = bits.into_reader();
         self.states = [ll_state, ml_state, of_state];
         self.remaining = remaining;
     }
