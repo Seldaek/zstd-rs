@@ -284,16 +284,18 @@ pub(crate) fn copy_match(buf: &mut [u8], end: usize, offset: usize, len: usize) 
     }
 }
 
-/// The pattern repeats every `offset` bytes, so after writing the first multiple of `offset` that is at least
-/// 16 bytes long, the rest copies in 16 byte chunks from that distance.
+/// The pattern repeats every `offset` bytes. Copying 16 bytes onto the end of what is valid so far doubles it,
+/// the bytes copied beyond that are overwritten by the next copy. Once at least 16 bytes are valid, the rest
+/// copies in 16 byte chunks from that distance, a multiple of `offset`.
 #[inline(never)]
 fn copy_match_short_offset(buf: &mut [u8], end: usize, offset: usize, len: usize) {
-    let distance = offset * 16usize.div_ceil(offset);
-    let head = len.min(distance);
-    for i in end..end + head {
-        buf[i] = buf[i - offset];
+    let start = end - offset;
+    let mut distance = offset;
+    while distance < 16 {
+        buf.copy_within(start..start + 16, start + distance);
+        distance *= 2;
     }
-    let mut i = end + distance;
+    let mut i = start + distance;
     while i < end + len {
         buf.copy_within(i - distance..i - distance + 16, i);
         i += 16;
