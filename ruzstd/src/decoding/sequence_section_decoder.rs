@@ -300,6 +300,32 @@ impl<'a> SequenceReader<'a> {
         })
     }
 
+    /// Runs `f` on sequences for as long as they can be decoded without checked refills, leaving at least the
+    /// last one to `next`. Works on copies of the state so it stays in registers.
+    #[inline(always)]
+    pub(crate) fn for_each_fast<E>(
+        &mut self,
+        mut f: impl FnMut(Sequence) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut br = self.br.clone();
+        let mut states = self.states;
+        let mut remaining = self.remaining;
+        let mut result = Ok(());
+        while remaining > 1 && br.byte_idx() > 16 {
+            remaining -= 1;
+            br.refill_unchecked();
+            let seq = decode_one::<true>(&mut br, &mut states, self.tables, false);
+            if let Err(e) = f(seq) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.br = br;
+        self.states = states;
+        self.remaining = remaining;
+        result
+    }
+
     /// Checks that the bitstream ended exactly with the last sequence.
     pub(crate) fn finish(self) -> Result<(), DecodeSequenceError> {
         match self.br.bits_remaining() {
